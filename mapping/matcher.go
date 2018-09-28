@@ -10,13 +10,11 @@ func (m *Mapping) pointMatcher() (NodeMatcher, error) {
 	m.mappings(PointTable, mappings)
 	filters := make(tableElementFilters)
 	m.addFilters(filters)
-	m.addTypedFilters(PointTable, filters)
 	tables, err := m.tables(PointTable)
 	return &tagMatcher{
 		mappings:   mappings,
 		filters:    filters,
 		tables:     tables,
-		matchAreas: false,
 	}, err
 }
 
@@ -25,12 +23,15 @@ func (m *Mapping) lineStringMatcher() (WayMatcher, error) {
 	m.mappings(LineStringTable, mappings)
 	filters := make(tableElementFilters)
 	m.addFilters(filters)
-	m.addTypedFilters(LineStringTable, filters)
+	areaTags, linearTags := m.getAreaTags()
 	tables, err := m.tables(LineStringTable)
 	return &tagMatcher{
 		mappings:   mappings,
 		filters:    filters,
 		tables:     tables,
+		areaTags:   areaTags,
+		linearTags: linearTags,
+		matchLines: true,
 		matchAreas: false,
 	}, err
 }
@@ -40,7 +41,7 @@ func (m *Mapping) polygonMatcher() (RelWayMatcher, error) {
 	m.mappings(PolygonTable, mappings)
 	filters := make(tableElementFilters)
 	m.addFilters(filters)
-	m.addTypedFilters(PolygonTable, filters)
+	areaTags, linearTags := m.getAreaTags()
 	relFilters := make(tableElementFilters)
 	m.addRelationFilters(PolygonTable, relFilters)
 	tables, err := m.tables(PolygonTable)
@@ -49,6 +50,9 @@ func (m *Mapping) polygonMatcher() (RelWayMatcher, error) {
 		filters:    filters,
 		tables:     tables,
 		relFilters: relFilters,
+		areaTags:   areaTags,
+		linearTags: linearTags,
+		matchLines: false,
 		matchAreas: true,
 	}, err
 }
@@ -58,8 +62,6 @@ func (m *Mapping) relationMatcher() (RelationMatcher, error) {
 	m.mappings(RelationTable, mappings)
 	filters := make(tableElementFilters)
 	m.addFilters(filters)
-	m.addTypedFilters(PolygonTable, filters)
-	m.addTypedFilters(RelationTable, filters)
 	relFilters := make(tableElementFilters)
 	m.addRelationFilters(RelationTable, relFilters)
 	tables, err := m.tables(RelationTable)
@@ -68,7 +70,6 @@ func (m *Mapping) relationMatcher() (RelationMatcher, error) {
 		filters:    filters,
 		tables:     tables,
 		relFilters: relFilters,
-		matchAreas: true,
 	}, err
 }
 
@@ -77,7 +78,6 @@ func (m *Mapping) relationMemberMatcher() (RelationMatcher, error) {
 	m.mappings(RelationMemberTable, mappings)
 	filters := make(tableElementFilters)
 	m.addFilters(filters)
-	m.addTypedFilters(RelationMemberTable, filters)
 	relFilters := make(tableElementFilters)
 	m.addRelationFilters(RelationMemberTable, relFilters)
 	tables, err := m.tables(RelationMemberTable)
@@ -86,7 +86,6 @@ func (m *Mapping) relationMemberMatcher() (RelationMatcher, error) {
 		filters:    filters,
 		tables:     tables,
 		relFilters: relFilters,
-		matchAreas: true,
 	}, err
 }
 
@@ -127,6 +126,9 @@ type tagMatcher struct {
 	tables     map[string]*rowBuilder
 	filters    tableElementFilters
 	relFilters tableElementFilters
+	areaTags   map[Key]struct{}
+	linearTags map[Key]struct{}
+	matchLines bool
 	matchAreas bool
 }
 
@@ -135,23 +137,7 @@ func (tm *tagMatcher) MatchNode(node *element.Node) []Match {
 }
 
 func (tm *tagMatcher) MatchWay(way *element.Way) []Match {
-	if tm.matchAreas { // match way as polygon
-		if way.IsClosed() {
-			if way.Tags["area"] == "no" {
-				return nil
-			}
-			return tm.match(way.Tags, true, false)
-		}
-	} else { // match way as linestring
-		if way.IsClosed() {
-			if way.Tags["area"] == "yes" {
-				return nil
-			}
-			return tm.match(way.Tags, true, false)
-		}
-		return tm.match(way.Tags, false, false)
-	}
-	return nil
+	return tm.match(way.Tags, way.IsClosed(), false)
 }
 
 func (tm *tagMatcher) MatchRelation(rel *element.Relation) []Match {
@@ -205,7 +191,35 @@ func (tm *tagMatcher) match(tags element.Tags, closed bool, relation bool) []Mat
 	for t, match := range tables {
 		filters, ok := tm.filters[t.Name]
 		filteredOut := false
-		if ok {
+		if !relation && (tm.matchLines || tm.matchAreas) {
+			if !closed {
+				// open way is always a linestring
+				filteredOut = tm.matchLines == false
+			} else {
+				// allow to include closed ways as linestrings if explicitly marked
+				// default -> area
+				// area=no or linear tags -> line
+				// area=yes or area tags -> area
+				filteredOut = tm.matchAreas && tags["area"] == "no" || !tm.matchAreas && tags["area"] != "no"
+				for k, _ := range tm.linearTags {
+					if _, ok := tags[string(k)]; ok {
+						filteredOut = tm.matchAreas
+						break
+					}
+				}
+				// but area=yes or area tag means it shouldn't be a linestring
+				if tags["area"] == "yes" {
+					filteredOut = tm.matchAreas
+				}
+				for k, _ := range tm.areaTags {
+					if _, ok := tags[string(k)]; ok {
+						filteredOut = !tm.matchAreas
+						break
+					}
+				}
+			}
+		}
+		if ok && !filteredOut {
 			for _, filter := range filters {
 				if !filter(tags, Key(match.Key), closed) {
 					filteredOut = true
